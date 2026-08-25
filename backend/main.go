@@ -108,7 +108,7 @@ func main() {
 	mux.Handle("PATCH /api/records/{id}/return", app.auth(http.HandlerFunc(app.handleReturnRecord)))
 	mux.Handle("GET /api/reports/daily", app.auth(http.HandlerFunc(app.handleDailyReport)))
 
-	addr := env("APP_ADDR", ":8080")
+	addr := serverAddress()
 	log.Printf("backend listening on %s", addr)
 	if err := http.ListenAndServe(addr, cors(mux)); err != nil {
 		log.Fatal(err)
@@ -357,6 +357,19 @@ func env(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func serverAddress() string {
+	if addr := env("APP_ADDR", ""); addr != "" {
+		return addr
+	}
+	if port := env("PORT", ""); port != "" {
+		if strings.HasPrefix(port, ":") {
+			return port
+		}
+		return ":" + port
+	}
+	return ":8080"
 }
 
 func loadEnvFile(path string) {

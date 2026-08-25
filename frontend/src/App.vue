@@ -9,6 +9,7 @@ const reportDate = ref(new Date().toISOString().slice(0, 10))
 const statusFilter = ref('all')
 const records = ref([])
 const report = ref(null)
+const apiBaseUrl = import.meta.env.VITE_API_URL || ''
 
 const loginForm = reactive({
   username: 'admin',
@@ -32,7 +33,7 @@ const filteredRecords = computed(() => {
 })
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await fetch(`${apiBaseUrl}${path}`, {
     ...options,
     headers: {
       'Content-Type': 'application/json',

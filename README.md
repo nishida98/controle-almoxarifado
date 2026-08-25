@@ -4,7 +4,7 @@ Projeto simples para controlar entrada e saida de itens do almoxarifado.
 
 ## Estrutura
 
-- `backend/`: API em Go com armazenamento local em JSON.
+- `backend/`: API em Go com MongoDB.
 - `frontend/`: aplicacao Vue.js com Vite.
 
 ## Como rodar
@@ -28,6 +28,7 @@ Voce pode alterar com variaveis de ambiente:
 - `APP_USER`
 - `APP_PASSWORD`
 - `APP_ADDR`
+- `PORT` (usado se `APP_ADDR` nao estiver definido)
 - `MONGODB_URI`
 - `MONGODB_DATABASE` (padrao: `controle_almoxarifado`)
 - `MONGODB_COLLECTION` (padrao: `records`)
@@ -41,6 +42,12 @@ $env:MONGODB_URI="mongodb+srv://usuario:senha@cluster.mongodb.net/?appName=Clust
 go run .
 ```
 
+Build do backend:
+
+```bash
+go build -tags netgo -ldflags "-s -w" -o app
+```
+
 ### Frontend
 
 ```bash
@@ -50,3 +57,13 @@ npm run dev
 ```
 
 O frontend sobe em `http://localhost:5173` e faz proxy para o backend.
+
+Em producao, se o frontend ficar em um dominio diferente do backend, configure:
+
+- `VITE_API_URL` com a URL publica do backend, por exemplo `https://sua-api.onrender.com`
+
+Build do frontend:
+
+```bash
+npm run build
+```
