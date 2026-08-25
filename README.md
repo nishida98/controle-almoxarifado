@@ -30,6 +30,7 @@ Voce pode alterar com variaveis de ambiente:
 - `APP_ADDR`
 - `PORT` (usado se `APP_ADDR` nao estiver definido)
 - `MONGODB_URI`
+- `MONGO_URI` ou `DATABASE_URL` tambem sao aceitas como alternativa
 - `MONGODB_DATABASE` (padrao: `controle_almoxarifado`)
 - `MONGODB_COLLECTION` (padrao: `records`)
 
@@ -46,6 +47,14 @@ Build do backend:
 
 ```bash
 go build -tags netgo -ldflags "-s -w" -o app
+```
+
+No Render, configure essas variaveis no **Web Service do backend**. Variaveis adicionadas no Static Site do frontend nao ficam disponiveis para a API Go.
+
+Cole a URI do MongoDB sem barras invertidas. Exemplo correto:
+
+```env
+MONGODB_URI=mongodb+srv://usuario:senha@cluster0.exemplo.mongodb.net/?appName=Cluster0
 ```
 
 ### Frontend

@@ -2,5 +2,5 @@ node_modules/
 dist/
 data/
 *.exe
+backend/app
 .env
-

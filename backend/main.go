@@ -359,6 +359,16 @@ func env(key, fallback string) string {
 	return value
 }
 
+func envFirst(keys ...string) (string, string) {
+	for _, key := range keys {
+		value := strings.TrimSpace(os.Getenv(key))
+		if value != "" {
+			return value, key
+		}
+	}
+	return "", ""
+}
+
 func serverAddress() string {
 	if addr := env("APP_ADDR", ""); addr != "" {
 		return addr
@@ -395,13 +405,14 @@ func loadEnvFile(path string) {
 }
 
 func connectMongo(ctx context.Context) (*mongo.Client, *mongo.Collection, error) {
-	uri := env("MONGODB_URI", "")
+	uri, uriKey := envFirst("MONGODB_URI", "MONGO_URI", "DATABASE_URL")
 	if uri == "" {
-		return nil, nil, errors.New("MONGODB_URI nao configurada")
+		return nil, nil, errors.New("URI do MongoDB nao configurada; defina MONGODB_URI no servico backend do Render")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
+	log.Printf("mongodb uri configured from %s", uriKey)
 	client, err := mongo.Connect(options.Client().ApplyURI(uri))
 	if err != nil {
 		return nil, nil, err
@@ -411,8 +422,17 @@ func connectMongo(ctx context.Context) (*mongo.Client, *mongo.Collection, error)
 		return nil, nil, err
 	}
 
-	database := env("MONGODB_DATABASE", "controle_almoxarifado")
-	collection := env("MONGODB_COLLECTION", "records")
+	database, databaseKey := envFirst("MONGODB_DATABASE", "MONGO_DATABASE")
+	if database == "" {
+		database = "controle_almoxarifado"
+		databaseKey = "default"
+	}
+	collection, collectionKey := envFirst("MONGODB_COLLECTION", "MONGO_COLLECTION")
+	if collection == "" {
+		collection = "records"
+		collectionKey = "default"
+	}
+	log.Printf("mongodb database=%s source=%s collection=%s source=%s", database, databaseKey, collection, collectionKey)
 	return client, client.Database(database).Collection(collection), nil
 }
 
