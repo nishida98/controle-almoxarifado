@@ -3,4 +3,5 @@ dist/
 data/
 *.exe
 backend/app
+backend/bootstrap
 .env

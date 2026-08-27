@@ -2,41 +2,51 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/awslabs/aws-lambda-go-api-proxy/httpadapter"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 type App struct {
-	mu         sync.Mutex
-	sessions   map[string]string
-	collection *mongo.Collection
-	user       string
-	password   string
+	db          *dynamodb.Client
+	table       string
+	user        string
+	password    string
+	tokenSecret []byte
 }
 
 type Record struct {
-	ID         string     `json:"id" bson:"_id"`
-	PersonName string     `json:"personName" bson:"personName"`
-	ItemName   string     `json:"itemName" bson:"itemName"`
-	Quantity   int        `json:"quantity" bson:"quantity"`
-	Notes      string     `json:"notes" bson:"notes"`
-	Status     string     `json:"status" bson:"status"`
-	CheckoutAt time.Time  `json:"checkoutAt" bson:"checkoutAt"`
-	ReturnedAt *time.Time `json:"returnedAt,omitempty" bson:"returnedAt,omitempty"`
-	CreatedBy  string     `json:"createdBy" bson:"createdBy"`
+	ID           string     `json:"id" dynamodbav:"id"`
+	PersonName   string     `json:"personName" dynamodbav:"personName"`
+	ItemName     string     `json:"itemName" dynamodbav:"itemName"`
+	Quantity     int        `json:"quantity" dynamodbav:"quantity"`
+	Notes        string     `json:"notes" dynamodbav:"notes"`
+	Status       string     `json:"status" dynamodbav:"status"`
+	CheckoutAt   time.Time  `json:"checkoutAt" dynamodbav:"checkoutAt"`
+	CheckoutDate string     `json:"-" dynamodbav:"checkoutDate"`
+	ReturnedAt   *time.Time `json:"returnedAt,omitempty" dynamodbav:"returnedAt,omitempty"`
+	CreatedBy    string     `json:"createdBy" dynamodbav:"createdBy"`
 }
 
 type LoginRequest struct {
@@ -81,38 +91,62 @@ type ReportSummary struct {
 func main() {
 	loadEnvFile(".env")
 
-	client, collection, err := connectMongo(context.Background())
+	app, err := newApp(context.Background())
 	if err != nil {
-		log.Fatalf("connect mongodb: %v", err)
-	}
-	defer func() {
-		if err := client.Disconnect(context.Background()); err != nil {
-			log.Printf("disconnect mongodb: %v", err)
-		}
-	}()
-
-	app := &App{
-		sessions:   map[string]string{},
-		collection: collection,
-		user:       env("APP_USER", "admin"),
-		password:   env("APP_PASSWORD", "admin123"),
+		log.Fatalf("init backend: %v", err)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/login", app.handleLogin)
-	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-	mux.Handle("GET /api/records", app.auth(http.HandlerFunc(app.handleListRecords)))
-	mux.Handle("POST /api/records", app.auth(http.HandlerFunc(app.handleCreateRecord)))
-	mux.Handle("PATCH /api/records/{id}/return", app.auth(http.HandlerFunc(app.handleReturnRecord)))
-	mux.Handle("GET /api/reports/daily", app.auth(http.HandlerFunc(app.handleDailyReport)))
+	handler := cors(app.routes())
+	if env("AWS_LAMBDA_FUNCTION_NAME", "") != "" || env("LAMBDA_TASK_ROOT", "") != "" {
+		lambda.Start(httpadapter.New(handler).ProxyWithContext)
+		return
+	}
 
 	addr := serverAddress()
 	log.Printf("backend listening on %s", addr)
-	if err := http.ListenAndServe(addr, cors(mux)); err != nil {
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func newApp(ctx context.Context) (*App, error) {
+	client, err := connectDynamo(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	table := env("DYNAMODB_TABLE", "")
+	if table == "" {
+		return nil, errors.New("DYNAMODB_TABLE nao configurada")
+	}
+
+	password := env("APP_PASSWORD", "admin123")
+	secret := env("APP_TOKEN_SECRET", password)
+	if len(secret) < 16 {
+		log.Print("APP_TOKEN_SECRET nao configurado ou curto; usando APP_PASSWORD como segredo do token")
+	}
+
+	log.Printf("dynamodb table=%s", table)
+	return &App{
+		db:          client,
+		table:       table,
+		user:        env("APP_USER", "admin"),
+		password:    password,
+		tokenSecret: []byte(secret),
+	}, nil
+}
+
+func (a *App) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/login", a.handleLogin)
+	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.Handle("GET /api/records", a.auth(http.HandlerFunc(a.handleListRecords)))
+	mux.Handle("POST /api/records", a.auth(http.HandlerFunc(a.handleCreateRecord)))
+	mux.Handle("PATCH /api/records/{id}/return", a.auth(http.HandlerFunc(a.handleReturnRecord)))
+	mux.Handle("GET /api/reports/daily", a.auth(http.HandlerFunc(a.handleDailyReport)))
+	return mux
 }
 
 func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -126,28 +160,23 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := newToken()
+	token, err := a.signToken(req.Username)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Erro ao criar sessao")
 		return
 	}
-
-	a.mu.Lock()
-	a.sessions[token] = req.Username
-	a.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, LoginResponse{Token: token, User: req.Username})
 }
 
 func (a *App) handleListRecords(w http.ResponseWriter, r *http.Request) {
 	date := r.URL.Query().Get("date")
-
-	filter, err := dateFilter(date)
-	if err != nil {
+	if _, err := parseReportDate(date); err != nil {
 		writeError(w, http.StatusBadRequest, "Data invalida")
 		return
 	}
-	records, err := a.findRecords(r.Context(), filter)
+
+	records, err := a.findRecords(r.Context(), date)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Erro ao buscar registros")
 		return
@@ -173,23 +202,35 @@ func (a *App) handleCreateRecord(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user := r.Context().Value(userContextKey{}).(string)
-
 	id, err := newToken()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Erro ao criar registro")
 		return
 	}
+
+	now := time.Now().UTC()
 	record := Record{
-		ID:         id,
-		PersonName: req.PersonName,
-		ItemName:   req.ItemName,
-		Quantity:   req.Quantity,
-		Notes:      req.Notes,
-		Status:     "pending",
-		CheckoutAt: time.Now(),
-		CreatedBy:  user,
+		ID:           id,
+		PersonName:   req.PersonName,
+		ItemName:     req.ItemName,
+		Quantity:     req.Quantity,
+		Notes:        req.Notes,
+		Status:       "pending",
+		CheckoutAt:   now,
+		CheckoutDate: now.Format("2006-01-02"),
+		CreatedBy:    user,
 	}
-	if _, err := a.collection.InsertOne(r.Context(), record); err != nil {
+
+	item, err := attributevalue.MarshalMap(record)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Erro ao preparar registro")
+		return
+	}
+	if _, err := a.db.PutItem(r.Context(), &dynamodb.PutItemInput{
+		TableName:           aws.String(a.table),
+		Item:                item,
+		ConditionExpression: aws.String("attribute_not_exists(id)"),
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "Erro ao salvar registro")
 		return
 	}
@@ -204,26 +245,36 @@ func (a *App) handleReturnRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := time.Now()
-	update := bson.M{
-		"$set": bson.M{
-			"status":     "returned",
-			"returnedAt": now,
+	now := time.Now().UTC()
+	result, err := a.db.UpdateItem(r.Context(), &dynamodb.UpdateItemInput{
+		TableName: aws.String(a.table),
+		Key: map[string]types.AttributeValue{
+			"id": &types.AttributeValueMemberS{Value: id},
 		},
-	}
-	result, err := a.collection.UpdateOne(r.Context(), bson.M{"_id": id}, update)
+		ConditionExpression: aws.String("attribute_exists(id)"),
+		UpdateExpression:    aws.String("SET #status = :status, returnedAt = :returnedAt"),
+		ExpressionAttributeNames: map[string]string{
+			"#status": "status",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":status":     &types.AttributeValueMemberS{Value: "returned"},
+			":returnedAt": &types.AttributeValueMemberS{Value: now.Format(time.RFC3339Nano)},
+		},
+		ReturnValues: types.ReturnValueAllNew,
+	})
 	if err != nil {
+		var conditionErr *types.ConditionalCheckFailedException
+		if errors.As(err, &conditionErr) {
+			writeError(w, http.StatusNotFound, "Registro nao encontrado")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "Erro ao salvar devolucao")
-		return
-	}
-	if result.MatchedCount == 0 {
-		writeError(w, http.StatusNotFound, "Registro nao encontrado")
 		return
 	}
 
 	var record Record
-	if err := a.collection.FindOne(r.Context(), bson.M{"_id": id}).Decode(&record); err != nil {
-		writeError(w, http.StatusInternalServerError, "Erro ao buscar registro")
+	if err := attributevalue.UnmarshalMap(result.Attributes, &record); err != nil {
+		writeError(w, http.StatusInternalServerError, "Erro ao ler registro")
 		return
 	}
 	writeJSON(w, http.StatusOK, record)
@@ -232,15 +283,14 @@ func (a *App) handleReturnRecord(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleDailyReport(w http.ResponseWriter, r *http.Request) {
 	date := r.URL.Query().Get("date")
 	if date == "" {
-		date = time.Now().Format("2006-01-02")
+		date = time.Now().UTC().Format("2006-01-02")
 	}
-
-	filter, err := dateFilter(date)
-	if err != nil {
+	if _, err := parseReportDate(date); err != nil {
 		writeError(w, http.StatusBadRequest, "Data invalida")
 		return
 	}
-	records, err := a.findRecords(r.Context(), filter)
+
+	records, err := a.findRecords(r.Context(), date)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Erro ao buscar relatorio")
 		return
@@ -307,10 +357,8 @@ func (a *App) auth(next http.Handler) http.Handler {
 			return
 		}
 
-		a.mu.Lock()
-		user, ok := a.sessions[token]
-		a.mu.Unlock()
-		if !ok {
+		user, err := a.verifyToken(token)
+		if err != nil {
 			writeError(w, http.StatusUnauthorized, "Sessao invalida")
 			return
 		}
@@ -322,7 +370,7 @@ func (a *App) auth(next http.Handler) http.Handler {
 
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Origin", env("CORS_ORIGIN", "*"))
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
 		if r.Method == http.MethodOptions {
@@ -351,22 +399,52 @@ func newToken() (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
+func (a *App) signToken(user string) (string, error) {
+	expiresAt := time.Now().UTC().Add(24 * time.Hour).Unix()
+	payload := fmt.Sprintf("%s|%d", user, expiresAt)
+	signature := a.sign(payload)
+	return base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + signature, nil
+}
+
+func (a *App) verifyToken(token string) (string, error) {
+	payloadPart, signature, ok := strings.Cut(token, ".")
+	if !ok {
+		return "", errors.New("token invalido")
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(payloadPart)
+	if err != nil {
+		return "", err
+	}
+	payload := string(payloadBytes)
+	if !hmac.Equal([]byte(signature), []byte(a.sign(payload))) {
+		return "", errors.New("assinatura invalida")
+	}
+	user, expiresAtRaw, ok := strings.Cut(payload, "|")
+	if !ok || user == "" {
+		return "", errors.New("payload invalido")
+	}
+	expiresAt, err := strconv.ParseInt(expiresAtRaw, 10, 64)
+	if err != nil {
+		return "", err
+	}
+	if time.Now().UTC().Unix() > expiresAt {
+		return "", errors.New("token expirado")
+	}
+	return user, nil
+}
+
+func (a *App) sign(payload string) string {
+	mac := hmac.New(sha256.New, a.tokenSecret)
+	mac.Write([]byte(payload))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
 func env(key, fallback string) string {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
 		return fallback
 	}
 	return value
-}
-
-func envFirst(keys ...string) (string, string) {
-	for _, key := range keys {
-		value := strings.TrimSpace(os.Getenv(key))
-		if value != "" {
-			return value, key
-		}
-	}
-	return "", ""
 }
 
 func serverAddress() string {
@@ -404,69 +482,60 @@ func loadEnvFile(path string) {
 	}
 }
 
-func connectMongo(ctx context.Context) (*mongo.Client, *mongo.Collection, error) {
-	uri, uriKey := envFirst("MONGODB_URI", "MONGO_URI", "DATABASE_URL")
-	if uri == "" {
-		return nil, nil, errors.New("URI do MongoDB nao configurada; defina MONGODB_URI no servico backend do Render")
-	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	log.Printf("mongodb uri configured from %s", uriKey)
-	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+func connectDynamo(ctx context.Context) (*dynamodb.Client, error) {
+	region := env("AWS_REGION", "us-east-1")
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := client.Ping(ctx, nil); err != nil {
-		_ = client.Disconnect(context.Background())
-		return nil, nil, err
+		return nil, err
 	}
 
-	database, databaseKey := envFirst("MONGODB_DATABASE", "MONGO_DATABASE")
-	if database == "" {
-		database = "controle_almoxarifado"
-		databaseKey = "default"
+	endpoint := env("DYNAMODB_ENDPOINT", "")
+	if endpoint == "" {
+		return dynamodb.NewFromConfig(cfg), nil
 	}
-	collection, collectionKey := envFirst("MONGODB_COLLECTION", "MONGO_COLLECTION")
-	if collection == "" {
-		collection = "records"
-		collectionKey = "default"
-	}
-	log.Printf("mongodb database=%s source=%s collection=%s source=%s", database, databaseKey, collection, collectionKey)
-	return client, client.Database(database).Collection(collection), nil
+
+	return dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String(endpoint)
+	}), nil
 }
 
-func (a *App) findRecords(ctx context.Context, filter bson.M) ([]Record, error) {
-	opts := options.Find().SetSort(bson.D{{Key: "checkoutAt", Value: -1}})
-	cursor, err := a.collection.Find(ctx, filter, opts)
-	if err != nil {
-		return nil, err
+func (a *App) findRecords(ctx context.Context, date string) ([]Record, error) {
+	input := &dynamodb.ScanInput{
+		TableName: aws.String(a.table),
 	}
-	defer cursor.Close(ctx)
+	if strings.TrimSpace(date) != "" {
+		input.FilterExpression = aws.String("checkoutDate = :date")
+		input.ExpressionAttributeValues = map[string]types.AttributeValue{
+			":date": &types.AttributeValueMemberS{Value: date},
+		}
+	}
 
 	var records []Record
-	if err := cursor.All(ctx, &records); err != nil {
-		return nil, err
+	paginator := dynamodb.NewScanPaginator(a.db, input)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var pageRecords []Record
+		if err := attributevalue.UnmarshalListOfMaps(page.Items, &pageRecords); err != nil {
+			return nil, err
+		}
+		records = append(records, pageRecords...)
 	}
+
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].CheckoutAt.After(records[j].CheckoutAt)
+	})
 	if records == nil {
-		records = []Record{}
+		return []Record{}, nil
 	}
 	return records, nil
 }
 
-func dateFilter(date string) (bson.M, error) {
+func parseReportDate(date string) (time.Time, error) {
 	if strings.TrimSpace(date) == "" {
-		return bson.M{}, nil
+		return time.Time{}, nil
 	}
-	start, err := time.ParseInLocation("2006-01-02", date, time.Local)
-	if err != nil {
-		return nil, err
-	}
-	end := start.AddDate(0, 0, 1)
-	return bson.M{
-		"checkoutAt": bson.M{
-			"$gte": start,
-			"$lt":  end,
-		},
-	}, nil
+	return time.Parse("2006-01-02", date)
 }

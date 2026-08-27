@@ -4,7 +4,7 @@ Projeto simples para controlar entrada e saida de itens do almoxarifado.
 
 ## Estrutura
 
-- `backend/`: API em Go com MongoDB.
+- `backend/`: API em Go para AWS Lambda com DynamoDB.
 - `frontend/`: aplicacao Vue.js com Vite.
 
 ## Como rodar
@@ -27,19 +27,21 @@ Voce pode alterar com variaveis de ambiente:
 
 - `APP_USER`
 - `APP_PASSWORD`
+- `APP_TOKEN_SECRET`
 - `APP_ADDR`
 - `PORT` (usado se `APP_ADDR` nao estiver definido)
-- `MONGODB_URI`
-- `MONGO_URI` ou `DATABASE_URL` tambem sao aceitas como alternativa
-- `MONGODB_DATABASE` (padrao: `controle_almoxarifado`)
-- `MONGODB_COLLECTION` (padrao: `records`)
+- `AWS_REGION`
+- `DYNAMODB_TABLE`
+- `DYNAMODB_ENDPOINT` (opcional, para DynamoDB local)
+- `CORS_ORIGIN`
 
 Voce pode criar um arquivo `backend/.env` baseado em `backend/.env.example`. Esse arquivo fica ignorado pelo Git.
 
 No PowerShell:
 
 ```powershell
-$env:MONGODB_URI="mongodb+srv://usuario:senha@cluster.mongodb.net/?appName=Cluster0"
+$env:AWS_REGION="us-east-1"
+$env:DYNAMODB_TABLE="controle-almoxarifado-records"
 go run .
 ```
 
@@ -49,13 +51,41 @@ Build do backend:
 go build -tags netgo -ldflags "-s -w" -o app
 ```
 
-No Render, configure essas variaveis no **Web Service do backend**. Variaveis adicionadas no Static Site do frontend nao ficam disponiveis para a API Go.
+### Deploy AWS Lambda
 
-Cole a URI do MongoDB sem barras invertidas. Exemplo correto:
+O backend tambem esta preparado para rodar como Lambda em container.
 
-```env
-MONGODB_URI=mongodb+srv://usuario:senha@cluster0.exemplo.mongodb.net/?appName=Cluster0
+Arquivos principais:
+
+- `backend/Dockerfile`
+- `backend/template.yaml`
+
+Build local da imagem:
+
+```bash
+cd backend
+docker build -t controle-almoxarifado-api .
 ```
+
+Deploy com AWS SAM:
+
+```bash
+cd backend
+sam build
+sam deploy --guided
+```
+
+O template cria:
+
+- uma Lambda container para a API HTTP
+- uma tabela DynamoDB on-demand
+- um HTTP API Gateway roteando `/{proxy+}`
+
+Configure no deploy:
+
+- `APP_PASSWORD`
+- `APP_TOKEN_SECRET`
+- `CORS_ORIGIN`
 
 ### Frontend
 
