@@ -8,7 +8,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.40
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.20.64
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.64.0
-	github.com/awslabs/aws-lambda-go-api-proxy v0.16.2
 )
 
 require (
@@ -26,8 +25,4 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.39.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.46.0 // indirect
 	github.com/aws/smithy-go v1.28.1 // indirect
-	github.com/google/go-cmp v0.6.0 // indirect
-	golang.org/x/net v0.21.0 // indirect
-	golang.org/x/sys v0.30.0 // indirect
-	golang.org/x/text v0.22.0 // indirect
 )

@@ -9,14 +9,20 @@ Projeto simples para controlar entrada e saida de itens do almoxarifado.
 
 ## Como rodar
 
-### Backend
+### Backend local
 
 ```bash
 cd backend
-go run .
+go test ./...
 ```
 
-A API sobe em `http://localhost:8080`.
+As funcoes foram separadas para deploy em Lambda. Para execucao local completa da API, use AWS SAM:
+
+```bash
+cd backend
+sam build
+sam local start-api
+```
 
 Login padrao:
 
@@ -45,26 +51,35 @@ $env:DYNAMODB_TABLE="controle-almoxarifado-records"
 go run .
 ```
 
-Build do backend:
+Build local das funcoes:
 
 ```bash
-go build -tags netgo -ldflags "-s -w" -o app
+go build -tags lambda.norpc -ldflags "-s -w" -o bootstrap-login ./cmd/login
+go build -tags lambda.norpc -ldflags "-s -w" -o bootstrap-records-get ./cmd/records-get
+go build -tags lambda.norpc -ldflags "-s -w" -o bootstrap-records-write ./cmd/records-write
+go build -tags lambda.norpc -ldflags "-s -w" -o bootstrap-report ./cmd/report
 ```
 
 ### Deploy AWS Lambda
 
-O backend tambem esta preparado para rodar como Lambda em container.
+O backend roda como quatro Lambdas em containers separados.
 
 Arquivos principais:
 
-- `backend/Dockerfile`
+- `backend/Dockerfile.login`
+- `backend/Dockerfile.records-get`
+- `backend/Dockerfile.records-write`
+- `backend/Dockerfile.report`
 - `backend/template.yaml`
 
-Build local da imagem:
+Build local das imagens:
 
 ```bash
 cd backend
-docker build -t controle-almoxarifado-api .
+docker build -f Dockerfile.login -t controle-almoxarifado-login .
+docker build -f Dockerfile.records-get -t controle-almoxarifado-records-get .
+docker build -f Dockerfile.records-write -t controle-almoxarifado-records-write .
+docker build -f Dockerfile.report -t controle-almoxarifado-report .
 ```
 
 Deploy com AWS SAM:
@@ -77,11 +92,21 @@ sam deploy --guided
 
 O template cria:
 
-- uma Lambda container para a API HTTP
+- uma Lambda container para login e health check
+- uma Lambda container para listar registros
+- uma Lambda container para criar registros e marcar devolucao
+- uma Lambda container para relatorio diario
 - uma tabela DynamoDB on-demand
-- um HTTP API Gateway roteando `/{proxy+}`
+- um HTTP API Gateway roteando cada endpoint para sua Lambda
 
 Configure no deploy:
+
+- `AppUser`
+- `AppPassword`
+- `AppTokenSecret`
+- `CorsOrigin`
+
+Esses parametros alimentam as variaveis:
 
 - `APP_PASSWORD`
 - `APP_TOKEN_SECRET`

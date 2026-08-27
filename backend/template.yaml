@@ -2,6 +2,22 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: Controle Almoxarifado API em Lambda container com DynamoDB.
 
+Parameters:
+  AppUser:
+    Type: String
+    Default: admin
+  AppPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+  AppTokenSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+  CorsOrigin:
+    Type: String
+    Default: "*"
+
 Globals:
   Function:
     Timeout: 15
@@ -9,11 +25,67 @@ Globals:
     Environment:
       Variables:
         DYNAMODB_TABLE: !Ref RecordsTable
-        APP_USER: admin
-        CORS_ORIGIN: "*"
+        APP_USER: !Ref AppUser
+        APP_PASSWORD: !Ref AppPassword
+        APP_TOKEN_SECRET: !Ref AppTokenSecret
+        CORS_ORIGIN: !Ref CorsOrigin
 
 Resources:
-  ApiFunction:
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref CorsOrigin
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        AllowMethods:
+          - GET
+          - POST
+          - PATCH
+          - OPTIONS
+
+  LoginFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Events:
+        Login:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/login
+            Method: POST
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/health
+            Method: GET
+    Metadata:
+      DockerContext: .
+      Dockerfile: Dockerfile.login
+
+  RecordsGetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref RecordsTable
+      Events:
+        ListRecords:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/records
+            Method: GET
+    Metadata:
+      DockerContext: .
+      Dockerfile: Dockerfile.records-get
+
+  RecordsWriteFunction:
     Type: AWS::Serverless::Function
     Properties:
       PackageType: Image
@@ -21,14 +93,39 @@ Resources:
         - DynamoDBCrudPolicy:
             TableName: !Ref RecordsTable
       Events:
-        Api:
+        CreateRecord:
           Type: HttpApi
           Properties:
-            Path: /{proxy+}
-            Method: ANY
+            ApiId: !Ref HttpApi
+            Path: /api/records
+            Method: POST
+        ReturnRecord:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/records/{id}/return
+            Method: PATCH
     Metadata:
       DockerContext: .
-      Dockerfile: Dockerfile
+      Dockerfile: Dockerfile.records-write
+
+  ReportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref RecordsTable
+      Events:
+        DailyReport:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/reports/daily
+            Method: GET
+    Metadata:
+      DockerContext: .
+      Dockerfile: Dockerfile.report
 
   RecordsTable:
     Type: AWS::DynamoDB::Table
@@ -44,8 +141,7 @@ Resources:
 Outputs:
   ApiUrl:
     Description: URL publica da API.
-    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
   RecordsTableName:
     Description: Nome da tabela DynamoDB.
     Value: !Ref RecordsTable
-

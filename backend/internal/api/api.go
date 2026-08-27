@@ -1,4 +1,4 @@
-package main
+package api
 
 import (
 	"context"
@@ -11,16 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/awslabs/aws-lambda-go-api-proxy/httpadapter"
-
+	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
@@ -88,40 +85,19 @@ type ReportSummary struct {
 	TotalItems   int `json:"totalItems"`
 }
 
-func main() {
-	loadEnvFile(".env")
-
-	app, err := newApp(context.Background())
-	if err != nil {
-		log.Fatalf("init backend: %v", err)
-	}
-
-	handler := cors(app.routes())
-	if env("AWS_LAMBDA_FUNCTION_NAME", "") != "" || env("LAMBDA_TASK_ROOT", "") != "" {
-		lambda.Start(httpadapter.New(handler).ProxyWithContext)
-		return
-	}
-
-	addr := serverAddress()
-	log.Printf("backend listening on %s", addr)
-	if err := http.ListenAndServe(addr, handler); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func newApp(ctx context.Context) (*App, error) {
+func New(ctx context.Context) (*App, error) {
 	client, err := connectDynamo(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	table := env("DYNAMODB_TABLE", "")
+	table := Env("DYNAMODB_TABLE", "")
 	if table == "" {
 		return nil, errors.New("DYNAMODB_TABLE nao configurada")
 	}
 
-	password := env("APP_PASSWORD", "admin123")
-	secret := env("APP_TOKEN_SECRET", password)
+	password := Env("APP_PASSWORD", "admin123")
+	secret := Env("APP_TOKEN_SECRET", password)
 	if len(secret) < 16 {
 		log.Print("APP_TOKEN_SECRET nao configurado ou curto; usando APP_PASSWORD como segredo do token")
 	}
@@ -130,91 +106,134 @@ func newApp(ctx context.Context) (*App, error) {
 	return &App{
 		db:          client,
 		table:       table,
-		user:        env("APP_USER", "admin"),
+		user:        Env("APP_USER", "admin"),
 		password:    password,
 		tokenSecret: []byte(secret),
 	}, nil
 }
 
-func (a *App) routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/login", a.handleLogin)
-	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-	mux.Handle("GET /api/records", a.auth(http.HandlerFunc(a.handleListRecords)))
-	mux.Handle("POST /api/records", a.auth(http.HandlerFunc(a.handleCreateRecord)))
-	mux.Handle("PATCH /api/records/{id}/return", a.auth(http.HandlerFunc(a.handleReturnRecord)))
-	mux.Handle("GET /api/reports/daily", a.auth(http.HandlerFunc(a.handleDailyReport)))
-	return mux
+func (a *App) Health(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
+	return JSON(200, map[string]string{"status": "ok"}), nil
 }
 
-func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
-	var req LoginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "JSON invalido")
-		return
+func (a *App) Login(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
+	var body LoginRequest
+	if err := json.Unmarshal([]byte(req.Body), &body); err != nil {
+		return Error(400, "JSON invalido"), nil
 	}
-	if req.Username != a.user || req.Password != a.password {
-		writeError(w, http.StatusUnauthorized, "Usuario ou senha invalidos")
-		return
+	if body.Username != a.user || body.Password != a.password {
+		return Error(401, "Usuario ou senha invalidos"), nil
 	}
 
-	token, err := a.signToken(req.Username)
+	token, err := a.signToken(body.Username)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Erro ao criar sessao")
-		return
+		return Error(500, "Erro ao criar sessao"), nil
 	}
-
-	writeJSON(w, http.StatusOK, LoginResponse{Token: token, User: req.Username})
+	return JSON(200, LoginResponse{Token: token, User: body.Username}), nil
 }
 
-func (a *App) handleListRecords(w http.ResponseWriter, r *http.Request) {
-	date := r.URL.Query().Get("date")
+func (a *App) ListRecords(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
+	if _, err := a.authUser(req); err != nil {
+		return Error(401, "Sessao invalida"), nil
+	}
+
+	date := req.QueryStringParameters["date"]
 	if _, err := parseReportDate(date); err != nil {
-		writeError(w, http.StatusBadRequest, "Data invalida")
-		return
+		return Error(400, "Data invalida"), nil
 	}
 
-	records, err := a.findRecords(r.Context(), date)
+	records, err := a.findRecords(ctx, date)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Erro ao buscar registros")
-		return
+		return Error(500, "Erro ao buscar registros"), nil
 	}
-	writeJSON(w, http.StatusOK, records)
+	return JSON(200, records), nil
 }
 
-func (a *App) handleCreateRecord(w http.ResponseWriter, r *http.Request) {
-	var req CreateRecordRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "JSON invalido")
-		return
-	}
-	req.PersonName = strings.TrimSpace(req.PersonName)
-	req.ItemName = strings.TrimSpace(req.ItemName)
-	req.Notes = strings.TrimSpace(req.Notes)
-	if req.PersonName == "" || req.ItemName == "" {
-		writeError(w, http.StatusBadRequest, "Pessoa e item sao obrigatorios")
-		return
-	}
-	if req.Quantity <= 0 {
-		req.Quantity = 1
+func (a *App) WriteRecord(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
+	user, err := a.authUser(req)
+	if err != nil {
+		return Error(401, "Sessao invalida"), nil
 	}
 
-	user := r.Context().Value(userContextKey{}).(string)
+	switch req.RequestContext.HTTP.Method {
+	case "POST":
+		return a.createRecord(ctx, req, user)
+	case "PATCH":
+		return a.returnRecord(ctx, req)
+	default:
+		return Error(405, "Metodo nao permitido"), nil
+	}
+}
+
+func (a *App) DailyReport(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
+	if _, err := a.authUser(req); err != nil {
+		return Error(401, "Sessao invalida"), nil
+	}
+
+	date := req.QueryStringParameters["date"]
+	if date == "" {
+		date = time.Now().UTC().Format("2006-01-02")
+	}
+	if _, err := parseReportDate(date); err != nil {
+		return Error(400, "Data invalida"), nil
+	}
+
+	records, err := a.findRecords(ctx, date)
+	if err != nil {
+		return Error(500, "Erro ao buscar relatorio"), nil
+	}
+
+	byPerson := map[string]*ReportBucket{}
+	byItem := map[string]*ReportBucket{}
+	summary := ReportSummary{}
+	for _, record := range records {
+		summary.TotalRecords++
+		summary.TotalItems += record.Quantity
+		if record.Status == "returned" {
+			summary.Returned++
+		} else {
+			summary.Pending++
+		}
+		addBucket(byPerson, record.PersonName, record)
+		addBucket(byItem, record.ItemName, record)
+	}
+
+	return JSON(200, DailyReport{
+		Date:     date,
+		ByPerson: buckets(byPerson),
+		ByItem:   buckets(byItem),
+		Records:  records,
+		Summary:  summary,
+	}), nil
+}
+
+func (a *App) createRecord(ctx context.Context, req events.APIGatewayV2HTTPRequest, user string) (events.APIGatewayV2HTTPResponse, error) {
+	var body CreateRecordRequest
+	if err := json.Unmarshal([]byte(req.Body), &body); err != nil {
+		return Error(400, "JSON invalido"), nil
+	}
+	body.PersonName = strings.TrimSpace(body.PersonName)
+	body.ItemName = strings.TrimSpace(body.ItemName)
+	body.Notes = strings.TrimSpace(body.Notes)
+	if body.PersonName == "" || body.ItemName == "" {
+		return Error(400, "Pessoa e item sao obrigatorios"), nil
+	}
+	if body.Quantity <= 0 {
+		body.Quantity = 1
+	}
+
 	id, err := newToken()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Erro ao criar registro")
-		return
+		return Error(500, "Erro ao criar registro"), nil
 	}
 
 	now := time.Now().UTC()
 	record := Record{
 		ID:           id,
-		PersonName:   req.PersonName,
-		ItemName:     req.ItemName,
-		Quantity:     req.Quantity,
-		Notes:        req.Notes,
+		PersonName:   body.PersonName,
+		ItemName:     body.ItemName,
+		Quantity:     body.Quantity,
+		Notes:        body.Notes,
 		Status:       "pending",
 		CheckoutAt:   now,
 		CheckoutDate: now.Format("2006-01-02"),
@@ -223,30 +242,26 @@ func (a *App) handleCreateRecord(w http.ResponseWriter, r *http.Request) {
 
 	item, err := attributevalue.MarshalMap(record)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Erro ao preparar registro")
-		return
+		return Error(500, "Erro ao preparar registro"), nil
 	}
-	if _, err := a.db.PutItem(r.Context(), &dynamodb.PutItemInput{
+	if _, err := a.db.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:           aws.String(a.table),
 		Item:                item,
 		ConditionExpression: aws.String("attribute_not_exists(id)"),
 	}); err != nil {
-		writeError(w, http.StatusInternalServerError, "Erro ao salvar registro")
-		return
+		return Error(500, "Erro ao salvar registro"), nil
 	}
-
-	writeJSON(w, http.StatusCreated, record)
+	return JSON(201, record), nil
 }
 
-func (a *App) handleReturnRecord(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSpace(r.PathValue("id"))
+func (a *App) returnRecord(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
+	id := strings.TrimSpace(req.PathParameters["id"])
 	if id == "" {
-		writeError(w, http.StatusBadRequest, "ID obrigatorio")
-		return
+		return Error(400, "ID obrigatorio"), nil
 	}
 
 	now := time.Now().UTC()
-	result, err := a.db.UpdateItem(r.Context(), &dynamodb.UpdateItemInput{
+	result, err := a.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(a.table),
 		Key: map[string]types.AttributeValue{
 			"id": &types.AttributeValueMemberS{Value: id},
@@ -265,60 +280,34 @@ func (a *App) handleReturnRecord(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var conditionErr *types.ConditionalCheckFailedException
 		if errors.As(err, &conditionErr) {
-			writeError(w, http.StatusNotFound, "Registro nao encontrado")
-			return
+			return Error(404, "Registro nao encontrado"), nil
 		}
-		writeError(w, http.StatusInternalServerError, "Erro ao salvar devolucao")
-		return
+		return Error(500, "Erro ao salvar devolucao"), nil
 	}
 
 	var record Record
 	if err := attributevalue.UnmarshalMap(result.Attributes, &record); err != nil {
-		writeError(w, http.StatusInternalServerError, "Erro ao ler registro")
-		return
+		return Error(500, "Erro ao ler registro"), nil
 	}
-	writeJSON(w, http.StatusOK, record)
+	return JSON(200, record), nil
 }
 
-func (a *App) handleDailyReport(w http.ResponseWriter, r *http.Request) {
-	date := r.URL.Query().Get("date")
-	if date == "" {
-		date = time.Now().UTC().Format("2006-01-02")
+func (a *App) authUser(req events.APIGatewayV2HTTPRequest) (string, error) {
+	header := header(req.Headers, "authorization")
+	token := strings.TrimPrefix(header, "Bearer ")
+	if token == header || token == "" {
+		return "", errors.New("sessao obrigatoria")
 	}
-	if _, err := parseReportDate(date); err != nil {
-		writeError(w, http.StatusBadRequest, "Data invalida")
-		return
-	}
+	return a.verifyToken(token)
+}
 
-	records, err := a.findRecords(r.Context(), date)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Erro ao buscar relatorio")
-		return
-	}
-
-	byPerson := map[string]*ReportBucket{}
-	byItem := map[string]*ReportBucket{}
-	summary := ReportSummary{}
-
-	for _, record := range records {
-		summary.TotalRecords++
-		summary.TotalItems += record.Quantity
-		if record.Status == "returned" {
-			summary.Returned++
-		} else {
-			summary.Pending++
+func header(headers map[string]string, name string) string {
+	for key, value := range headers {
+		if strings.EqualFold(key, name) {
+			return value
 		}
-		addBucket(byPerson, record.PersonName, record)
-		addBucket(byItem, record.ItemName, record)
 	}
-
-	writeJSON(w, http.StatusOK, DailyReport{
-		Date:     date,
-		ByPerson: buckets(byPerson),
-		ByItem:   buckets(byItem),
-		Records:  records,
-		Summary:  summary,
-	})
+	return ""
 }
 
 func addBucket(index map[string]*ReportBucket, name string, record Record) {
@@ -346,49 +335,22 @@ func buckets(index map[string]*ReportBucket) []ReportBucket {
 	return result
 }
 
-type userContextKey struct{}
-
-func (a *App) auth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		header := r.Header.Get("Authorization")
-		token := strings.TrimPrefix(header, "Bearer ")
-		if token == header || token == "" {
-			writeError(w, http.StatusUnauthorized, "Sessao obrigatoria")
-			return
-		}
-
-		user, err := a.verifyToken(token)
-		if err != nil {
-			writeError(w, http.StatusUnauthorized, "Sessao invalida")
-			return
-		}
-
-		ctx := context.WithValue(r.Context(), userContextKey{}, user)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+func JSON(status int, value any) events.APIGatewayV2HTTPResponse {
+	body, _ := json.Marshal(value)
+	return events.APIGatewayV2HTTPResponse{
+		StatusCode: status,
+		Headers: map[string]string{
+			"Content-Type":                 "application/json",
+			"Access-Control-Allow-Origin":  Env("CORS_ORIGIN", "*"),
+			"Access-Control-Allow-Headers": "Content-Type, Authorization",
+			"Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
+		},
+		Body: string(body),
+	}
 }
 
-func cors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", env("CORS_ORIGIN", "*"))
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
-}
-
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{"error": message})
+func Error(status int, message string) events.APIGatewayV2HTTPResponse {
+	return JSON(status, map[string]string{"error": message})
 }
 
 func newToken() (string, error) {
@@ -439,7 +401,7 @@ func (a *App) sign(payload string) string {
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-func env(key, fallback string) string {
+func Env(key, fallback string) string {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
 		return fallback
@@ -447,20 +409,7 @@ func env(key, fallback string) string {
 	return value
 }
 
-func serverAddress() string {
-	if addr := env("APP_ADDR", ""); addr != "" {
-		return addr
-	}
-	if port := env("PORT", ""); port != "" {
-		if strings.HasPrefix(port, ":") {
-			return port
-		}
-		return ":" + port
-	}
-	return ":8080"
-}
-
-func loadEnvFile(path string) {
+func LoadEnvFile(path string) {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -483,13 +432,13 @@ func loadEnvFile(path string) {
 }
 
 func connectDynamo(ctx context.Context) (*dynamodb.Client, error) {
-	region := env("AWS_REGION", "us-east-1")
+	region := Env("AWS_REGION", "us-east-1")
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return nil, err
 	}
 
-	endpoint := env("DYNAMODB_ENDPOINT", "")
+	endpoint := Env("DYNAMODB_ENDPOINT", "")
 	if endpoint == "" {
 		return dynamodb.NewFromConfig(cfg), nil
 	}
